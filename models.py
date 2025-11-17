@@ -1,0 +1,623 @@
+import subprocess
+import cv2
+import numpy as np
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+from PIL import Image
+import io
+import time
+import sys
+import os
+import logging
+import random
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import requests
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ============================================
+# CẤU HÌNH ADB BRIDGE
+# ============================================
+
+# Đặt URL của ADB Bridge (thay đổi theo môi trường)
+ADB_BRIDGE_URL = "https://unscaly-unslumbrous-odessa.ngrok-free.dev/"
+USE_ADB_BRIDGE = os.getenv('USE_ADB_BRIDGE', 'true').lower() == 'true'
+
+logger.info(f"🔧 ADB Bridge: {'Enabled' if USE_ADB_BRIDGE else 'Disabled'}")
+if USE_ADB_BRIDGE:
+    logger.info(f"🌐 ADB Bridge URL: {ADB_BRIDGE_URL}")
+
+DEFAULT_SCALES = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+
+TEMPLATE_SCALES = {
+    'item_nv': [0.8, 0.9, 1.0, 1.1, 1.2],
+    'btn_xacnhan': [0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+    'captra': [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+}
+
+# ============================================
+# CACHE CLASSES
+# ============================================
+
+class TemplateCache:
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+    
+    def get(self, path, scales=None):
+        if scales is None:
+            scales = DEFAULT_SCALES
+        
+        cache_key = (path, tuple(scales))
+        
+        with self._lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+            
+            template = cv2.imread(path)
+            if template is None:
+                logger.error(f"❌ Không đọc được template: {path}")
+                return None
+            
+            scaled_templates = []
+            temp_h, temp_w = template.shape[:2]
+            
+            for scale in scales:
+                if scale == 1.0:
+                    scaled_templates.append((template, scale, temp_w, temp_h))
+                else:
+                    new_w = int(temp_w * scale)
+                    new_h = int(temp_h * scale)
+                    resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    scaled_templates.append((resized, scale, new_w, new_h))
+            
+            self._cache[cache_key] = scaled_templates
+            logger.info(f"✅ Đã cache template: {os.path.basename(path)} với {len(scales)} tỉ lệ")
+            return scaled_templates
+    
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            logger.info("🗑️  Đã xóa cache template")
+
+class ScreenshotBuffer:
+    def __init__(self, ttl=0.3):
+        self._buffer = None
+        self._timestamp = 0
+        self._ttl = ttl
+        self._lock = threading.Lock()
+    
+    def get(self, force_refresh=False):
+        with self._lock:
+            current_time = time.time()
+            
+            if not force_refresh and self._buffer is not None:
+                age = current_time - self._timestamp
+                if age < self._ttl:
+                    logger.debug(f"♻️  Tái sử dụng ảnh chụp (tuổi: {age:.2f}s)")
+                    return self._buffer
+            
+            logger.debug("📸 Đang chụp ảnh màn hình mới")
+            data = adb_screencap_bytes()
+            img = Image.open(io.BytesIO(data))
+            self._buffer = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            self._timestamp = current_time
+            
+            return self._buffer
+    
+    def invalidate(self):
+        with self._lock:
+            self._timestamp = 0
+
+_template_cache = TemplateCache()
+_screenshot_buffer = ScreenshotBuffer(ttl=0.3)
+
+# ============================================
+# HÀM ADB - HỖ TRỢ CẢ BRIDGE VÀ TRỰC TIẾP
+# ============================================
+
+def adb_screencap_bytes():
+    """Chụp ảnh màn hình qua ADB hoặc ADB Bridge"""
+    if USE_ADB_BRIDGE:
+        try:
+            response = requests.get(f'{ADB_BRIDGE_URL}/screenshot', timeout=10)
+            if response.status_code == 200:
+                return response.content
+            else:
+                raise Exception(f"ADB Bridge error: HTTP {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Lỗi kết nối ADB Bridge: {e}")
+            raise RuntimeError(f"Không thể chụp màn hình qua ADB Bridge: {e}")
+    else:
+        p = subprocess.run(["adb", "exec-out", "screencap", "-p"], stdout=subprocess.PIPE)
+        if p.returncode != 0:
+            raise RuntimeError("adb chụp màn hình thất bại")
+        return p.stdout
+
+_screen_size_cache = None
+
+def get_screen_size():
+    """Lấy kích thước màn hình từ ADB (có cache)"""
+    global _screen_size_cache
+    
+    if _screen_size_cache is not None:
+        return _screen_size_cache
+    
+    try:
+        if USE_ADB_BRIDGE:
+            response = requests.get(f'{ADB_BRIDGE_URL}/shell', 
+                                   params={'cmd': 'wm size'}, 
+                                   timeout=5)
+            if response.status_code != 200:
+                raise RuntimeError(f"ADB Bridge error: HTTP {response.status_code}")
+            output = response.json()['output'].strip()
+        else:
+            result = subprocess.run(
+                ["adb", "shell", "wm", "size"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Không thể lấy kích thước màn hình: {result.stderr}")
+            output = result.stdout.strip()
+        
+        # Parse: "Physical size: 1080x2400"
+        size_str = output.split(":")[-1].strip()
+        width, height = map(int, size_str.split("x"))
+        
+        _screen_size_cache = (width, height)
+        logger.info(f"📐 Kích thước màn hình: {width}x{height}")
+        return width, height
+        
+    except Exception as e:
+        raise RuntimeError(f"Lỗi lấy kích thước màn hình: {e}")
+
+def clear_screen_size_cache():
+    global _screen_size_cache
+    _screen_size_cache = None
+    logger.info("🗑️  Đã xóa cache kích thước màn hình")
+
+def adb_tap(x, y, randomize=True):
+    """Tap với random offset"""
+    if randomize:
+        x += random.randint(-5, 5)
+        y += random.randint(-5, 5)
+    
+    time.sleep(random.uniform(0.01, 0.03))
+    
+    x_int = int(x)
+    y_int = int(y)
+    
+    if USE_ADB_BRIDGE:
+        try:
+            response = requests.get(f'{ADB_BRIDGE_URL}/tap', 
+                                   params={'x': x_int, 'y': y_int}, 
+                                   timeout=5)
+            if response.status_code != 200:
+                logger.error(f"ADB Bridge tap error: HTTP {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Lỗi tap qua ADB Bridge: {e}")
+    else:
+        subprocess.run(["adb", "shell", "input", "tap", str(x_int), str(y_int)])
+    
+    logger.info(f"👆 Chạm tại ({x_int}, {y_int})")
+    _screenshot_buffer.invalidate()
+
+def adb_swipe(x1, y1, x2, y2, duration_ms=200, randomize=True):
+    """Swipe với random offset"""
+    if randomize:
+        x1 += random.randint(-3, 3)
+        y1 += random.randint(-3, 3)
+        x2 += random.randint(-3, 3)
+        y2 += random.randint(-3, 3)
+    
+    x1_int, y1_int = int(x1), int(y1)
+    x2_int, y2_int = int(x2), int(y2)
+    duration_int = int(duration_ms)
+    
+    if USE_ADB_BRIDGE:
+        try:
+            response = requests.get(f'{ADB_BRIDGE_URL}/swipe',
+                                   params={
+                                       'x1': x1_int, 'y1': y1_int,
+                                       'x2': x2_int, 'y2': y2_int,
+                                       'duration': duration_int
+                                   },
+                                   timeout=5)
+            if response.status_code != 200:
+                logger.error(f"ADB Bridge swipe error: HTTP {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Lỗi swipe qua ADB Bridge: {e}")
+    else:
+        subprocess.run(["adb", "shell", "input", "swipe", 
+                       str(x1_int), str(y1_int), str(x2_int), str(y2_int), str(duration_int)])
+    
+    logger.info(f"👉 Vuốt ({x1_int}, {y1_int}) -> ({x2_int}, {y2_int})")
+    _screenshot_buffer.invalidate()
+
+def scroll_up(scroll_percent=None):
+    """Kéo lên để xem nội dung phía trên"""
+    width, height = get_screen_size()
+    
+    x = random.randint(int(width * 0.4), int(width * 0.6))
+    start_y = random.randint(int(height * 0.6), int(height * 0.7))
+    
+    if scroll_percent is not None:
+        scroll_distance = (scroll_percent / 100) * height
+        
+        if scroll_percent <= 30:
+            duration = random.randint(200, 300)
+            pause = random.uniform(1.0, 2.0)
+            scroll_type = f"{scroll_percent}%"
+        elif scroll_percent <= 50:
+            duration = random.randint(300, 500)
+            pause = random.uniform(0.5, 1.5)
+            scroll_type = f"{scroll_percent}%"
+        else:
+            duration = random.randint(400, 600)
+            pause = random.uniform(0.3, 0.8)
+            scroll_type = f"{scroll_percent}%"
+    else:
+        scroll_types = ['short', 'medium', 'long']
+        scroll_type = random.choices(scroll_types, weights=[0.3, 0.5, 0.2])[0]
+        
+        if scroll_type == 'short':
+            scroll_distance = random.uniform(0.2, 0.3) * height
+            duration = random.randint(200, 300)
+            pause = random.uniform(1.0, 2.0)
+        elif scroll_type == 'medium':
+            scroll_distance = random.uniform(0.4, 0.6) * height
+            duration = random.randint(300, 500)
+            pause = random.uniform(0.5, 1.5)
+        else:
+            scroll_distance = random.uniform(0.6, 0.8) * height
+            duration = random.randint(400, 600)
+            pause = random.uniform(0.3, 0.8)
+    
+    end_y = int(start_y - scroll_distance)
+    
+    adb_swipe(x, start_y, x, end_y, duration, randomize=True)
+    time.sleep(pause)
+    logger.info(f"📱 Kéo lên ({scroll_type})")
+
+def adb_back():
+    """Back button"""
+    time.sleep(random.uniform(0.01, 0.03))
+    
+    if USE_ADB_BRIDGE:
+        try:
+            response = requests.get(f'{ADB_BRIDGE_URL}/shell', 
+                                   params={'cmd': 'input keyevent BACK'}, 
+                                   timeout=5)
+            if response.status_code != 200:
+                logger.error(f"ADB Bridge back error: HTTP {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Lỗi back qua ADB Bridge: {e}")
+    else:
+        subprocess.run(["adb", "shell", "input", "keyevent", "BACK"])
+    
+    logger.info("⬅️  Quay lại trang trước")
+    _screenshot_buffer.invalidate()
+
+# ============================================
+# TEMPLATE MATCHING
+# ============================================
+
+def match_template_multiscale(screen_bgr, template_path, threshold=0.6, 
+                              scales=None, early_exit_conf=0.9, debug=False):
+    result = {
+        'found': False,
+        'confidence': 0.0,
+        'location': None,
+        'bbox': None,
+        'scale': 1.0
+    }
+    
+    screen_h, screen_w = screen_bgr.shape[:2]
+    
+    scaled_templates = _template_cache.get(template_path, scales=scales)
+    if scaled_templates is None:
+        return result
+    
+    best_val = 0
+    best_match = None
+    best_scale = 1.0
+    
+    for template, scale, temp_w, temp_h in scaled_templates:
+        if temp_w > screen_w or temp_h > screen_h:
+            logger.debug(f"⏭️  Skip scale {scale:.2f} (quá lớn: {temp_w}x{temp_h})")
+            continue
+        
+        match_result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(match_result)
+        
+        logger.debug(f"📏 Scale {scale:.2f} ({temp_w}x{temp_h}) -> conf={max_val:.4f}")
+        
+        if max_val > best_val:
+            best_val = max_val
+            best_match = (max_loc, temp_w, temp_h)
+            best_scale = scale
+            
+            if max_val >= early_exit_conf:
+                logger.debug(f"⚡ Dừng sớm ở tỉ lệ {scale:.2f} (độ tin cậy={max_val:.4f})")
+                break
+    
+    if best_val >= threshold and best_match:
+        top_left, w, h = best_match
+        center_x = top_left[0] + w // 2
+        center_y = top_left[1] + h // 2
+        
+        result = {
+            'found': True,
+            'confidence': best_val,
+            'location': (center_x, center_y),
+            'bbox': (top_left[0], top_left[1], w, h),
+            'scale': best_scale
+        }
+        logger.info(f"✅ Tìm thấy ở tỉ lệ={best_scale:.2f}, độ tin cậy={best_val:.4f}, tâm=({center_x}, {center_y})")
+
+        if debug:
+            debug_img = screen_bgr.copy()
+            cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (0, 255, 0), 3)
+            cv2.circle(debug_img, (center_x, center_y), 8, (0, 0, 255), -1)
+            text = f"Conf: {best_val:.3f} | Scale: {best_scale:.2f}"
+            cv2.putText(debug_img, text, (top_left[0], top_left[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            debug_filename = f"debug_{os.path.basename(template_path).split('.')[0]}.png"
+            cv2.imwrite(debug_filename, debug_img)
+            logger.info(f"💾 Đã lưu {debug_filename}")
+    else:
+        logger.debug(f"❌ Không tìm thấy (độ tin cậy tốt nhất={best_val:.4f} < ngưỡng={threshold})")
+        
+        if debug and best_match:
+            debug_img = screen_bgr.copy()
+            top_left, w, h = best_match
+            cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (0, 0, 255), 3)
+            text = f"LOW: {best_val:.3f} | Scale: {best_scale:.2f}"
+            cv2.putText(debug_img, text, (top_left[0], top_left[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            debug_filename = f"debug_{os.path.basename(template_path).split('.')[0]}_failed.png"
+            cv2.imwrite(debug_filename, debug_img)
+            logger.info(f"💾 Đã lưu {debug_filename}")
+    
+    return result
+
+def load_screenshot_bgr(use_cache=True, force_refresh=False):
+    if not use_cache:
+        data = adb_screencap_bytes()
+        img = Image.open(io.BytesIO(data))
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    
+    return _screenshot_buffer.get(force_refresh=force_refresh)
+
+# ============================================
+# HIGH-LEVEL FUNCTIONS
+# ============================================
+
+def click_task_title(screen_bgr=None, max_attempts=2, debug=False, 
+                     template_path=r"./templates/item_nv.jpg"):
+    logger.info("🔍 Tìm tiêu đề nhiệm vụ...")
+    time.sleep(random.uniform(0.05, 0.15))
+    
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    for attempt in range(max_attempts):
+        try:
+            scales = TEMPLATE_SCALES.get('item_nv', DEFAULT_SCALES)
+            result = match_template_multiscale(screen_bgr, template_path, threshold=0.6, scales=scales, debug=debug)
+            
+            if result['found']:
+                center_x, center_y = result['location']
+                offset_left = 110
+                click_x = center_x - offset_left
+                click_y = result['bbox'][1] + int(result['bbox'][3] * 0.35)
+                logger.info(f"✅ Tiêu đề đã tìm thấy (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+                logger.info(f"👆 Nhấn tại ({click_x}, {click_y})")
+                if not debug:
+                    adb_tap(click_x, click_y, randomize=True)
+                return True
+            
+            logger.debug(f"Lần thử thứ {attempt+1}/{max_attempts} không thành công")
+        except Exception as e:
+            logger.error(f"Lỗi ở lần thử thứ {attempt+1}: {e}")
+        
+        if attempt < max_attempts - 1:
+            time.sleep(random.uniform(0.1, 0.2))
+            screen_bgr = load_screenshot_bgr(force_refresh=True)
+    
+    logger.error("❌ Không tìm thấy tiêu đề nhiệm vụ!")
+    return False
+
+def click_confirm_button(screen_bgr=None, max_attempts=2, debug=False, template_path=r"./templates/btn_xacnhan.jpg"):
+    logger.info("🔍 Đang tìm nút xác nhận...")
+    time.sleep(random.uniform(0.05, 0.1))
+    
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    for attempt in range(max_attempts):
+        try:
+            scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+            result = match_template_multiscale(screen_bgr, template_path, threshold=0.65, scales=scales, debug=debug)
+            
+            if result['found']:
+                click_x, click_y = result['location']
+                logger.info(f"✅ Nút xác nhận đã tìm thấy (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+                if not debug:
+                    adb_tap(click_x, click_y, randomize=True)
+                return True
+            
+            logger.debug(f"Lần thử thứ {attempt+1}/{max_attempts} không thành công")
+        except Exception as e:
+            logger.error(f"Lỗi ở lần thử thứ {attempt+1}: {e}")
+        
+        if attempt < max_attempts - 1:
+            time.sleep(random.uniform(0.1, 0.15))
+            screen_bgr = load_screenshot_bgr(force_refresh=True)
+    
+    logger.error("❌ Không tìm thấy nút xác nhận!")
+    return False
+
+def click_start_video(screen_bgr=None, max_attempts=2, debug=False, template_path=r"./templates/start_video.png"):
+    logger.info("🔍 Đang tìm nút startvideo...")
+    time.sleep(random.uniform(0.05, 0.1))
+    
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    for attempt in range(max_attempts):
+        try:
+            scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+            result = match_template_multiscale(screen_bgr, template_path, threshold=0.65, scales=scales, debug=debug)
+            
+            if result['found']:
+                click_x, click_y = result['location']
+                logger.info(f"✅ Nút xác nhận đã tìm thấy (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+                if not debug:
+                    adb_tap(click_x, click_y, randomize=True)
+                return True
+            
+            logger.debug(f"Lần thử thứ {attempt+1}/{max_attempts} không thành công")
+        except Exception as e:
+            logger.error(f"Lỗi ở lần thử thứ {attempt+1}: {e}")
+        
+        if attempt < max_attempts - 1:
+            time.sleep(random.uniform(0.1, 0.15))
+            screen_bgr = load_screenshot_bgr(force_refresh=True)
+    
+    logger.error("❌ Không tìm thấy nút xác nhận!")
+    return False
+
+def check_nv(screen_bgr=None, threshold=0.7, template_path=r"./templates/item_nv.jpg", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+    result = match_template_multiscale(screen_bgr, template_path, threshold=threshold, scales=scales, debug=debug)
+    if result['found']:
+        logger.info(f"Nhiệm Vụ đã được tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    return False
+
+def check_btn_start_video(screen_bgr=None, threshold=0.7, template_path=r"./templates/start_video.png", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+    result = match_template_multiscale(screen_bgr, template_path, threshold=threshold, scales=scales, debug=debug)
+    if result['found']:
+        logger.info(f"✅ Nút start video đã tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    return False
+
+def check_btn_xn(screen_bgr=None, threshold=0.7, template_path=r"./templates/btn_xacnhan.jpg", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+    result = match_template_multiscale(screen_bgr, template_path, threshold=threshold, scales=scales, debug=debug)
+    if result['found']:
+        logger.info(f"✅ Nút xác nhận đã tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    return False
+
+def check_time_cho(screen_bgr=None, threshold=0.6, template_path=r"./templates/time_cho.jpg", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    scales = TEMPLATE_SCALES.get('item_nv', DEFAULT_SCALES)
+    result = match_template_multiscale(screen_bgr, template_path, threshold=threshold, scales=scales, debug=debug)
+    if result['found']:
+        logger.info(f"✅ Xác nhận đang chạy nhiệm vụ! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    return False
+
+def check_captra(screen_bgr=None, threshold=0.5, template_path=r"./templates/captra.jpg", debug=False):
+    logger.info(f"🔍 Đang kiểm tra captcha (ngưỡng={threshold})...")
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    scales = TEMPLATE_SCALES.get('captra', DEFAULT_SCALES)
+    result = match_template_multiscale(screen_bgr, template_path, threshold=threshold, scales=scales, early_exit_conf=0.9, debug=debug)
+    if result['found']:
+        logger.info(f"✅ Đã phát hiện captcha! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    else:
+        logger.info(f"❌ Không tìm thấy captcha (độ tin cậy tốt nhất={result['confidence']:.3f})")
+        return False
+
+def check_template(template_path, screen_bgr=None, threshold=0.6, scales=None, debug=False, template_name=None):
+    if template_name is None:
+        template_name = os.path.basename(template_path)
+    logger.info(f"🔍 Đang kiểm tra {template_name} (ngưỡng={threshold})...")
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    result = match_template_multiscale(screen_bgr, template_path, threshold=threshold, scales=scales or DEFAULT_SCALES, debug=debug)
+    if result['found']:
+        logger.info(f"✅ {template_name} đã được tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+    else:
+        logger.info(f"❌ {template_name} không tìm thấy (độ tin cậy tốt nhất={result['confidence']:.3f})")
+    return result
+
+def preload_templates():
+    templates = {
+        'item_nv': (r"./templates/item_nv.jpg", TEMPLATE_SCALES.get('item_nv')),
+        'btn_xacnhan': (r"./templates/btn_xacnhan.jpg", TEMPLATE_SCALES.get('btn_xacnhan')),
+        'captra': (r"./templates/captra.jpg", TEMPLATE_SCALES.get('captra')),
+    }
+    
+    logger.info("🔄 Pre-loading templates...")
+    for name, (path, scales) in templates.items():
+        if os.path.exists(path):
+            _template_cache.get(path, scales=scales)
+    logger.info("✅ Đã nạp trước tất cả templates!")
+
+# Pre-load khi import module
+try:
+    preload_templates()
+except Exception as e:
+    logger.warning(f"Không thể nạp trước templates: {e}")
+
+# ============================================
+# MAIN TEST
+# ============================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🚀 KIỂM TRA TÌM KIẾM TEMPLATE ĐA TỈ LỆ")
+    print("=" * 60)
+    
+    try:
+        # Test kết nối ADB Bridge
+        if USE_ADB_BRIDGE:
+            print(f"\n🔗 Kiểm tra kết nối ADB Bridge: {ADB_BRIDGE_URL}")
+            try:
+                response = requests.get(f'{ADB_BRIDGE_URL}/', timeout=5)
+                if response.status_code == 200:
+                    print(f"✅ ADB Bridge đang hoạt động!")
+                    print(f"   Response: {response.json()}")
+                else:
+                    print(f"⚠️  ADB Bridge phản hồi HTTP {response.status_code}")
+            except Exception as e:
+                print(f"❌ Không thể kết nối tới ADB Bridge: {e}")
+                print(f"   Kiểm tra xem server đang chạy tại {ADB_BRIDGE_URL}")
+                sys.exit(1)
+        
+        # Load screenshot
+        print("\n📸 Đang tải ảnh màn hình...")
+        screen = load_screenshot_bgr(use_cache=False, force_refresh=True)
+        print(f"✅ Đã tải ảnh màn hình: {screen.shape}")
+        
+        # Test 1: Check button start video
+        print("\n📋 Test 1: Kiểm tra nút Start Video")
+        print("-" * 60)
+        check_btn_start_video(screen, debug=True)
+        
+        # Test 2: Check nhiệm vụ
+        print("\n📋 Test 2: Kiểm tra nhiệm vụ")
+        print("-" * 60)
+        check_nv(screen, debug=True)
+        
+    except Exception as e:
+        print(f"\n❌ LỖI: {e}")
+        import traceback
+        traceback.print_exc()

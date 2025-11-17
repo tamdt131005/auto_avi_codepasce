@@ -1,0 +1,13 @@
+# Requirements for Auto Aviso Model
+
+# Core dependencies
+opencv-python>=4.5.0
+numpy>=1.19.0
+Pillow>=8.0.0
+pytesseract>=0.3.0
+
+# ADB Bridge support (optional - only if using HTTP bridge)
+requests>=2.25.0
+
+# Audio support (optional)
+pygame>=2.0.0
